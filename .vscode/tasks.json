@@ -1,0 +1,13 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Validate package",
+			"type": "shell",
+			"command": ".venv/bin/pytest && .venv/bin/ruff check .",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "test"
+		}
+	]
+}
