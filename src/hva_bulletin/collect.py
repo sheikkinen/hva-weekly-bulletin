@@ -5,7 +5,12 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from .delta import reconcile_items, state_key
+from .delta import (
+    contains_replacement,
+    encoding_repair_keys,
+    reconcile_items,
+    state_key,
+)
 from .models import SourceEvent, SourceHealth, SourceItem
 from .storage import (
     load_item_state,
@@ -26,6 +31,58 @@ def _iso_week(moment: datetime) -> str:
     return f"{year}-W{week:02d}"
 
 
+def _load_metadata(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def _record_encoding_repair(
+    metadata: dict[str, object],
+    previous: dict[str, SourceItem],
+    current: list[SourceItem],
+    state: dict[str, SourceItem],
+    repair_keys: set[str],
+    observed_at: datetime,
+) -> None:
+    corrupt_before = {
+        key
+        for key, item in previous.items()
+        if item.source == "ktweb" and contains_replacement(item)
+    }
+    if not corrupt_before:
+        return
+    existing = metadata.get("ktweb_encoding_repair")
+    prior = existing if isinstance(existing, dict) else {}
+    incoming = {state_key(item): item for item in current}
+    unresolved = []
+    for key in sorted(corrupt_before - repair_keys):
+        old = previous[key]
+        new = incoming.get(key)
+        if new is None:
+            reason = "not present in the bounded collection window"
+        elif old.source_urls.get("ktweb") != new.source_urls.get("ktweb"):
+            reason = "source URL changed"
+        elif contains_replacement(new):
+            reason = "incoming record still contains replacement characters"
+        else:
+            reason = "record did not satisfy the bounded repair contract"
+        unresolved.append(
+            {
+                "source_id": old.source_id,
+                "url": str(old.source_urls["ktweb"]),
+                "reason": reason,
+            }
+        )
+    record = {
+        "started_at": prior.get("started_at", observed_at.isoformat()),
+        "status": "complete" if not unresolved else "partial",
+        "repaired_count": int(prior.get("repaired_count", 0)) + len(repair_keys),
+        "unresolved": unresolved,
+    }
+    if not unresolved:
+        record["completed_at"] = observed_at.isoformat()
+    metadata["ktweb_encoding_repair"] = record
+
+
 def persist_collection(
     root: Path,
     items: list[SourceItem],
@@ -35,7 +92,8 @@ def persist_collection(
     state_path = root / "state/source-items.jsonl"
     previous = load_item_state(state_path)
     baseline = not state_path.exists()
-    state, events = reconcile_items(previous, items, observed_at)
+    repair_keys = encoding_repair_keys(previous, items)
+    state, events = reconcile_items(previous, items, observed_at, repair_keys)
     changed = write_jsonl_if_changed(
         state_path,
         list(state.values()),
@@ -68,10 +126,14 @@ def persist_collection(
         )
 
     metadata_path = root / "state/metadata.json"
-    if baseline and not metadata_path.exists():
-        metadata_path.write_text(
-            json.dumps({"baseline_at": observed_at.isoformat()}, sort_keys=True) + "\n"
-        )
+    metadata = _load_metadata(metadata_path)
+    if baseline and "baseline_at" not in metadata:
+        metadata["baseline_at"] = observed_at.isoformat()
+    _record_encoding_repair(metadata, previous, items, state, repair_keys, observed_at)
+    metadata_content = json.dumps(metadata, sort_keys=True) + "\n"
+    if not metadata_path.exists() or metadata_path.read_text() != metadata_content:
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text(metadata_content)
         changed = True
 
     return CollectionResult(

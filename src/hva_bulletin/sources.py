@@ -2,9 +2,14 @@ import hashlib
 import json
 import re
 import subprocess
+import tempfile
 import xml.etree.ElementTree as ElementTree
+from codecs import lookup
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from email.parser import BytesHeaderParser
+from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
@@ -37,6 +42,12 @@ HVA_BUYER_TERMS = (
     "pohjanmaan",
     "keski-pohjanmaan",
 )
+
+
+@dataclass(frozen=True)
+class HttpResponse:
+    body: bytes
+    content_type: str | None
 
 
 def parse_date(value: object) -> date | None:
@@ -125,7 +136,7 @@ def normalize_record(
     )
 
 
-def request(url: str, payload: dict[str, Any] | None = None) -> bytes:
+def request_response(url: str, payload: dict[str, Any] | None = None) -> HttpResponse:
     command = [
         "curl",
         "-fsSL",
@@ -145,8 +156,64 @@ def request(url: str, payload: dict[str, Any] | None = None) -> bytes:
                 json.dumps(payload),
             ]
         )
-    command.append(url)
-    return subprocess.run(command, check=True, capture_output=True).stdout
+    with tempfile.TemporaryDirectory() as directory:
+        headers_path = Path(directory) / "headers"
+        command.extend(["--dump-header", str(headers_path), url])
+        body = subprocess.run(command, check=True, capture_output=True).stdout
+        header_blocks = re.split(rb"\r?\n\r?\n", headers_path.read_bytes())
+    content_type = None
+    for block in header_blocks:
+        if not block.startswith(b"HTTP/"):
+            continue
+        _, _, fields = block.partition(b"\n")
+        value = BytesHeaderParser().parsebytes(fields).get("Content-Type")
+        if value:
+            content_type = value
+    return HttpResponse(body=body, content_type=content_type)
+
+
+def request(url: str, payload: dict[str, Any] | None = None) -> bytes:
+    return request_response(url, payload).body
+
+
+def _declared_charset(body: bytes, content_type: str | None) -> str | None:
+    declarations = []
+    if content_type:
+        message = BytesHeaderParser().parsebytes(
+            f"Content-Type: {content_type}\n\n".encode("ascii")
+        )
+        if charset := message.get_content_charset():
+            declarations.append(charset)
+    meta_patterns = (
+        rb"<meta[^>]+charset\s*=\s*['\"]?\s*([\w.-]+)",
+        rb"<meta[^>]+content\s*=\s*['\"][^'\"]*charset\s*=\s*([\w.-]+)",
+    )
+    for pattern in meta_patterns:
+        if match := re.search(pattern, body[:8192], re.I):
+            declarations.append(match.group(1).decode("ascii"))
+    canonical = []
+    for declaration in declarations:
+        try:
+            canonical.append(lookup(declaration).name)
+        except LookupError as error:
+            raise ValueError(f"unsupported response charset: {declaration}") from error
+    if len(set(canonical)) > 1:
+        raise ValueError(f"contradictory response charsets: {sorted(set(canonical))}")
+    return canonical[0] if canonical else None
+
+
+def decode_html(body: bytes, content_type: str | None = None) -> str:
+    declared = _declared_charset(body, content_type)
+    encodings = [declared] if declared else ["utf-8", "windows-1252"]
+    for encoding in encodings:
+        try:
+            text = body.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if "\ufffd" in text:
+            raise ValueError("decoded response contains Unicode replacement characters")
+        return text
+    raise ValueError("response cannot be decoded losslessly")
 
 
 def item_from_link(
@@ -182,7 +249,8 @@ def collect_ktweb(organization: str, base_url: str, now: datetime) -> list[Sourc
     feed_url = f"{base_url.rstrip('/')}/ktwebscr/pk_rssfeed.htm"
     records = []
     for _, meeting_url in rss_entries(feed_url)[:5]:
-        html = request(meeting_url).decode("utf-8", errors="replace")
+        response = request_response(meeting_url)
+        html = decode_html(response.body, response.content_type)
         meeting_date = parse_date(html)
         matches = re.findall(
             r"<td[^>]*>\s*(\d+)\s*</td>\s*<td[^>]*>\s*"

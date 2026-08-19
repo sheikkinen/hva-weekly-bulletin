@@ -15,6 +15,17 @@ def previous_complete_window(now: datetime) -> tuple[datetime, datetime]:
     return end - timedelta(days=7), end
 
 
+def ensure_lossless_candidates(events: list[SourceEvent]) -> None:
+    for event in events:
+        item = event.item
+        values = (item.title, item.organization, item.body_excerpt or "")
+        if any("\ufffd" in value for value in values):
+            raise ValueError(
+                f"candidate contains Unicode replacement character: "
+                f"{event.source}:{event.source_id}"
+            )
+
+
 def build_window(root: Path, output: Path, now: datetime) -> int:
     start, end = previous_complete_window(now)
     events = [
@@ -31,6 +42,7 @@ def build_window(root: Path, output: Path, now: datetime) -> int:
     ]
     threads = link_events(events).confirmed
     candidates = order_events(events, threads, health, end.date(), cap=10)
+    ensure_lossless_candidates(candidates)
     output.mkdir(parents=True, exist_ok=True)
     write_jsonl_if_changed(
         output / "events.jsonl", events, lambda record: record.event_id

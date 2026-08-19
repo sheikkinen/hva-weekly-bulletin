@@ -15,9 +15,13 @@ from hva_bulletin.collect import persist_collection
 from hva_bulletin.config import load_hvas
 from hva_bulletin.models import SourceHealth, SourceItem
 from hva_bulletin.publish import publish_bulletin
+from hva_bulletin.sources import decode_html
 from hva_bulletin.storage import upsert_health
 from hva_bulletin.threads import link_events
-from hva_bulletin.weekly_window import previous_complete_window
+from hva_bulletin.weekly_window import (
+    ensure_lossless_candidates,
+    previous_complete_window,
+)
 
 NOW = datetime(2026, 8, 19, 6, tzinfo=UTC)
 
@@ -96,6 +100,22 @@ def test_collection_persists_baseline_delta_and_noop(tmp_path: Path) -> None:
     assert third.changed is False
     assert tracked_after == tracked_before
     assert state_before != (tmp_path / "state/source-items.jsonl").read_text()
+
+
+def test_collection_records_idempotent_encoding_repair(tmp_path: Path) -> None:
+    persist_collection(tmp_path, [item(title="P\ufffdytt\ufffdkirja")], [health()], NOW)
+    repaired = item(title="Pöytäkirja")
+    result = persist_collection(tmp_path, [repaired], [health()], NOW)
+    metadata = json.loads((tmp_path / "state/metadata.json").read_text())
+    assert result.events_written == 0
+    assert metadata["ktweb_encoding_repair"]["status"] == "complete"
+    assert metadata["ktweb_encoding_repair"]["repaired_count"] == 1
+    assert metadata["ktweb_encoding_repair"]["unresolved"] == []
+
+    before = (tmp_path / "state/metadata.json").read_text()
+    retry = persist_collection(tmp_path, [repaired], [health()], NOW)
+    assert retry.changed is False
+    assert (tmp_path / "state/metadata.json").read_text() == before
 
 
 def test_thread_links_confirmed_evidence_and_keeps_topic_candidate() -> None:
@@ -242,6 +262,32 @@ def test_ted_buyer_scope_is_limited_to_hvas() -> None:
     assert not _is_hva_buyer("Sansia Oy")
     assert not _is_hva_buyer("Lappica Oy")
     assert not _is_hva_buyer("Lapinjärven kunta")
+
+
+def test_ktweb_html_decoding_is_lossless_and_deterministic() -> None:
+    finnish = "<html><title>Pöytäkirjan tarkastaminen</title></html>"
+    assert "Pöytäkirjan" in decode_html(finnish.encode(), "text/html; charset=utf-8")
+    assert "Pöytäkirjan" in decode_html(finnish.encode("windows-1252"))
+    assert "Pöytäkirjan" in decode_html(
+        finnish.replace("<html>", '<html><meta charset="windows-1252">').encode(
+            "windows-1252"
+        )
+    )
+    with pytest.raises(ValueError, match="contradictory"):
+        decode_html(b'<meta charset="utf-8">ok', "text/html; charset=windows-1252")
+    with pytest.raises(ValueError, match="unsupported"):
+        decode_html(b"ok", "text/html; charset=made-up")
+    with pytest.raises(ValueError, match="cannot be decoded losslessly"):
+        decode_html(b"\x81")
+
+
+def test_weekly_candidates_reject_replacement_characters() -> None:
+    from hva_bulletin.delta import reconcile_items
+
+    baseline, _ = reconcile_items({}, [item()], NOW)
+    _, events = reconcile_items(baseline, [item(title="P\ufffdyttäkirja")], NOW)
+    with pytest.raises(ValueError, match="ktweb:ktweb-pohde-2026-08-18-42"):
+        ensure_lossless_candidates(events)
 
 
 def test_weekly_window_is_previous_seven_complete_utc_days() -> None:

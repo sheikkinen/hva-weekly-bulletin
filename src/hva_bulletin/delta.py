@@ -6,6 +6,7 @@ from typing import Any
 from .models import SourceEvent, SourceItem
 
 NOISE_FIELDS = {"fetched_at"}
+REPAIRABLE_TEXT_FIELDS = {"title", "organization", "body_excerpt"}
 
 
 def _normalize(value: Any) -> Any:
@@ -35,6 +36,27 @@ def content_hash(item: SourceItem) -> str:
 
 def state_key(item: SourceItem) -> str:
     return f"{item.source}:{item.source_id}"
+
+
+def contains_replacement(item: SourceItem) -> bool:
+    return any(
+        "\ufffd" in str(getattr(item, field) or "") for field in REPAIRABLE_TEXT_FIELDS
+    )
+
+
+def encoding_repair_keys(
+    previous: dict[str, SourceItem], current: list[SourceItem]
+) -> set[str]:
+    incoming = {state_key(item): item for item in current}
+    return {
+        key
+        for key, old in previous.items()
+        if old.source == "ktweb"
+        and contains_replacement(old)
+        and (new := incoming.get(key)) is not None
+        and not contains_replacement(new)
+        and old.source_urls.get("ktweb") == new.source_urls.get("ktweb")
+    }
 
 
 def _changed_fields(previous: SourceItem, current: SourceItem) -> list[str]:
@@ -67,6 +89,7 @@ def reconcile_items(
     previous: dict[str, SourceItem],
     current: list[SourceItem],
     observed_at: datetime,
+    repair_keys: set[str] | None = None,
 ) -> tuple[dict[str, SourceItem], list[SourceEvent]]:
     state = dict(previous)
     events: list[SourceEvent] = []
@@ -84,9 +107,19 @@ def reconcile_items(
             continue
         if content_hash(old) != content_hash(item):
             state[key] = item
-            events.append(
-                _event(item, "updated", observed_at, _changed_fields(old, item))
-            )
+            changed_fields = _changed_fields(old, item)
+            if key in (repair_keys or set()):
+                changed_fields = [
+                    field
+                    for field in changed_fields
+                    if not (
+                        field in REPAIRABLE_TEXT_FIELDS
+                        and "\ufffd" in str(getattr(old, field) or "")
+                        and "\ufffd" not in str(getattr(item, field) or "")
+                    )
+                ]
+            if changed_fields:
+                events.append(_event(item, "updated", observed_at, changed_fields))
         else:
             state[key] = old
 

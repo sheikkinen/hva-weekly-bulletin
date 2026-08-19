@@ -4,7 +4,7 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from hva_bulletin.delta import content_hash, reconcile_items
+from hva_bulletin.delta import content_hash, encoding_repair_keys, reconcile_items
 from hva_bulletin.materiality import order_events
 from hva_bulletin.models import SourceHealth, SourceItem, ThreadEdge
 from hva_bulletin.normalize import merge_hilma_ted
@@ -76,6 +76,33 @@ def test_baseline_update_and_retry_are_deterministic() -> None:
     assert retry_events == []
     assert retry_state == changed_state
     assert all(event.event_type != "removed" for event in changed_events)
+
+
+def test_encoding_repair_suppresses_only_repaired_text_fields() -> None:
+    corrupt = item("ktweb", title="P\ufffdytt\ufffdkirja")
+    previous = {"ktweb:ktweb-1": corrupt}
+    repaired = item("ktweb", title="Pöytäkirja")
+    repair_keys = encoding_repair_keys(previous, [repaired])
+
+    repaired_state, repair_events = reconcile_items(
+        previous, [repaired], NOW, repair_keys
+    )
+    assert repair_events == []
+    assert repaired_state["ktweb:ktweb-1"].title == "Pöytäkirja"
+
+    changed = repaired.model_copy(update={"deadline": date(2026, 8, 27)})
+    _, changed_events = reconcile_items(previous, [changed], NOW, repair_keys)
+    assert len(changed_events) == 1
+    assert changed_events[0].changed_fields == ["deadline"]
+
+    moved = item(
+        "ktweb",
+        title="Pöytäkirja",
+        source_urls={"ktweb": "https://example.test/ktweb/moved"},
+    )
+    assert encoding_repair_keys(previous, [moved]) == set()
+    _, moved_events = reconcile_items(previous, [moved], NOW)
+    assert moved_events[0].changed_fields == ["source_urls", "title"]
 
 
 def test_hilma_ted_publication_merges_without_fuzzy_matching() -> None:
