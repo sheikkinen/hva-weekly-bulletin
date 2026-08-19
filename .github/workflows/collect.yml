@@ -1,0 +1,46 @@
+name: Collect public source events
+
+on:
+  schedule:
+    - cron: '30 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hva-bulletin-state
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    env:
+      HVA_SOURCE_ADAPTERS: ktweb,dynasty,casem,hilma,ted,mao
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install .
+      - name: Install CaseM browser
+        run: python -m playwright install --with-deps chromium
+      - name: Collect allowlisted public adapters
+        run: python -m hva_bulletin.adapters --allowlist "$HVA_SOURCE_ADAPTERS" --output tmp
+      - name: Persist normalized delta
+        run: python -m hva_bulletin.collect --items tmp/items.jsonl --health tmp/health.jsonl
+      - name: Commit substantive state
+        run: |
+          git add state/ events/ source_health/
+          if git diff --cached --quiet; then
+            echo "No substantive or source-health changes"
+            exit 0
+          fi
+          git config user.name "hva-bulletin-bot"
+          git config user.email "hva-bulletin-bot@users.noreply.github.com"
+          git commit -m "collect public source events"
+          git pull --rebase
+          git push

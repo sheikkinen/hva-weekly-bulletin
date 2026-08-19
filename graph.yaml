@@ -1,0 +1,28 @@
+version: "1.0"
+name: hva-weekly-bulletin
+description: Schema-bound HVA weekly bulletin narrative synthesis over a prepared seven-day event window.
+
+prompts_relative: true
+prompts_dir: prompts
+
+defaults:
+  provider: anthropic
+  model: claude-sonnet-4-5
+  temperature: 0.2
+
+state:
+  window_json: str
+
+nodes:
+  summarize:
+    type: llm
+    prompt: summarize
+    variables:
+      window_json: "{state.window_json}"
+    state_key: bulletin
+
+edges:
+  - from: START
+    to: summarize
+  - from: summarize
+    to: END

@@ -1,0 +1,51 @@
+name: Publish weekly bulletin
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hva-bulletin-state
+  cancel-in-progress: false
+
+jobs:
+  bulletin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install .
+      - name: Select previous seven complete UTC days
+        id: window
+        run: |
+          python -m hva_bulletin.weekly_window --output tmp
+          echo "event_count=$(jq '.events | length' tmp/window.json)" >> "$GITHUB_OUTPUT"
+      - name: Summarize bounded candidates
+        if: steps.window.outputs.event_count != '0'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: yamlgraph graph run graph.yaml --var window_json=@tmp/window.json --export-state tmp/graph-state.json --full
+      - name: Publish validated Markdown and README copy
+        if: steps.window.outputs.event_count != '0'
+        run: python -m hva_bulletin.publish --week "$(date -u +%G-W%V)" --events tmp/events.jsonl --health tmp/health.jsonl --threads tmp/threads.jsonl --graph-state tmp/graph-state.json
+      - name: Commit bulletin
+        run: |
+          git add bulletins/ README.md
+          if git diff --cached --quiet; then
+            echo "No substantive events in the seven-day window"
+            exit 0
+          fi
+          git config user.name "hva-bulletin-bot"
+          git config user.email "hva-bulletin-bot@users.noreply.github.com"
+          git commit -m "bulletin $(date -u +%G-W%V)"
+          git pull --rebase
+          git push
